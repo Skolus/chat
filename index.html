@@ -393,7 +393,7 @@
   animate();
 })();
 
-// --- Chat Logic --- 
+// --- Chat Logic ---
 let peer = null;
 let conn = null;
 let myRoomCode = null;
@@ -477,31 +477,87 @@ function parseMarkdown(str) {
   return html;
 }
 
-function initPeer(code) {
+// ICE servers: STUN alone fails on strict NATs / CGNAT (very common on
+// home/mobile connections). Adding a public TURN relay as a fallback means
+// the connection can still succeed by relaying traffic instead of silently
+// timing out and showing "room not found" on a room that actually existed.
+const ICE_CONFIG = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+  ]
+};
+
+function initPeer(id) {
   return new Promise((resolve, reject) => {
-    const p = new Peer(PEER_PREFIX + code);
-    p.on('open', () => resolve(p));
-    p.on('error', (err) => reject(err));
+    const p = new Peer(id, { config: ICE_CONFIG });
+    let settled = false;
+    p.on('open', () => { settled = true; resolve(p); });
+    p.on('error', (err) => { if (!settled) { settled = true; reject(err); } });
+  });
+}
+
+function attachPeerLifecycle(p) {
+  // Keeps the underlying connection to the signaling server alive even if
+  // it drops briefly (sleep/wake, wifi blip), instead of leaving the peer
+  // in a dead state that looks "connected" but can never receive anyone.
+  p.on('disconnected', () => {
+    if (p.destroyed) return;
+    setStatus('reconnecting...', null);
+    p.reconnect();
+  });
+  p.on('error', (err) => {
+    console.warn('peer error:', err && err.type, err);
   });
 }
 
 // Auto-Host
-myRoomCode = randomCode();
-myCodeEl.textContent = myRoomCode;
-
-(async function autoHost() {
+async function startHost() {
+  myRoomCode = randomCode();
+  myCodeEl.textContent = myRoomCode;
   setStatus('opening room...', null);
+
   try {
-    peer = await initPeer(myRoomCode);
-    setStatus('waiting for someone to join with code ' + myRoomCode, 'ok');
-    peer.on('connection', (c) => {
-      conn = c;
-      setupConnection();
-    });
+    peer = await initPeer(PEER_PREFIX + myRoomCode);
   } catch (err) {
-    setStatus('could not open room, please refresh to try again', 'error');
+    if (err && err.type === 'unavailable-id') {
+      // Extremely rare code collision — silently mint a new one and retry.
+      return startHost();
+    }
+    setStatus('could not open room (network issue) — refresh to try again', 'error');
+    return;
   }
-})();
+
+  attachPeerLifecycle(peer);
+  setStatus('waiting for someone to join with code ' + myRoomCode, 'ok');
+
+  peer.on('connection', (c) => {
+    if (conn && conn.open) {
+      // Someone already in the room — reject extra joiners instead of
+      // silently swapping the active connection out from under the chat.
+      c.on('open', () => {
+        try { c.send({ type: 'system', text: 'this room is already full' }); } catch (e) {}
+        setTimeout(() => c.close(), 300);
+      });
+      return;
+    }
+    conn = c;
+    // IMPORTANT: wait for the connection to actually be open before treating
+    // it as connected. Reacting to peer.on('connection') alone means the
+    // handshake hasn't finished yet — that's what caused "connected" to show
+    // while sending silently did nothing.
+    conn.on('open', () => setupConnection());
+    conn.on('error', (err) => {
+      console.warn('connection error:', err);
+      setStatus('connection error, ask them to rejoin', 'error');
+    });
+  });
+}
+
+startHost();
 
 copyBtn.addEventListener('click', (e) => {
   e.stopPropagation();
@@ -516,43 +572,85 @@ joinBtn.addEventListener('click', async () => {
   if (!code) { setStatus('enter a code first', 'error'); return; }
   joinBtn.disabled = true;
   setStatus('connecting...', null);
+
   try {
     if (peer) peer.destroy();
-    peer = await initPeer(randomCode(8));
-    conn = peer.connect(PEER_PREFIX + code, { reliable: true });
-    myRoomCode = code;
-
-    conn.on('open', () => setupConnection());
-    conn.on('error', () => {
-      setStatus('could not connect, check the code', 'error');
-      joinBtn.disabled = false;
-    });
-
-    setTimeout(() => {
-      if (chatScreen.classList.contains('hidden')) {
-        setStatus('no room found with that code', 'error');
-        joinBtn.disabled = false;
-      }
-    }, 8000);
+    peer = await initPeer(PEER_PREFIX + randomCode(8));
   } catch (err) {
-    setStatus('connection failed, try again', 'error');
+    setStatus('connection failed (network issue), try again', 'error');
     joinBtn.disabled = false;
+    return;
   }
+
+  myRoomCode = code;
+  conn = peer.connect(PEER_PREFIX + code, { reliable: true });
+
+  let settled = false;
+  const fail = (message) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeoutId);
+    setStatus(message, 'error');
+    joinBtn.disabled = false;
+    if (conn) { try { conn.close(); } catch (e) {} }
+  };
+
+  // Fallback timeout for cases where neither an explicit error nor an open
+  // event ever fires (e.g. connection hangs mid-handshake).
+  const timeoutId = setTimeout(() => fail('no room found with that code'), 10000);
+
+  conn.on('open', () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeoutId);
+    setupConnection();
+  });
+
+  conn.on('error', (err) => {
+    console.warn('connection error:', err);
+    fail('could not connect, check the code');
+  });
+
+  // PeerJS reports a nonexistent room as a peer-level 'peer-unavailable'
+  // error, not a connection-level one — catching it here means the joiner
+  // gets an accurate "no room found" almost instantly instead of waiting
+  // out the full timeout.
+  peer.on('error', (err) => {
+    if (err && err.type === 'peer-unavailable') {
+      fail('no room found with that code');
+    }
+  });
+
+  attachPeerLifecycle(peer);
 });
 
 joinInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') joinBtn.click(); });
 
+let connectionEstablished = false;
+
 function setupConnection() {
+  if (connectionEstablished) return; // guard against double-invocation
+  connectionEstablished = true;
+
   conn.on('data', handleIncomingData);
   conn.on('close', () => {
     connDot.classList.remove('live');
     addSystemMessage('the other person left');
+    msgInput.disabled = true;
+    sendBtn.disabled = true;
+    attachBtn.disabled = true;
+  });
+  conn.on('error', (err) => {
+    console.warn('connection error after setup:', err);
   });
 
   roomLabel.textContent = myRoomCode;
   entryScreen.classList.add('hidden');
   chatScreen.classList.remove('hidden');
   connDot.classList.add('live');
+  msgInput.disabled = false;
+  sendBtn.disabled = false;
+  attachBtn.disabled = false;
   addSystemMessage('connected');
   msgInput.focus();
 }
@@ -569,6 +667,8 @@ function handleIncomingData(data) {
     typingIndicator.classList.add('hidden');
     addMessage(data, 'them');
     playSoftBeep();
+  } else if (data.type === 'system') {
+    addSystemMessage(data.text);
   } else {
     // Backwards compatibility
     typingIndicator.classList.add('hidden');
@@ -628,14 +728,24 @@ function addMessage(dataObj, who) {
 
 function sendMessage() {
   const text = msgInput.value.trim();
-  if (!text || !conn || !conn.open) return;
+  if (!text) return;
+
+  if (!conn || !conn.open) {
+    addSystemMessage('not connected — message not sent');
+    return;
+  }
 
   const payload = { type: 'chat', text: text };
-  conn.send(payload);
+  try {
+    conn.send(payload);
+  } catch (err) {
+    addSystemMessage('failed to send — connection dropped');
+    return;
+  }
   addMessage(payload, 'me');
 
   msgInput.value = '';
-  conn.send({ type: 'typing', state: false });
+  try { conn.send({ type: 'typing', state: false }); } catch (e) {}
 }
 
 // Typing Events
@@ -653,7 +763,12 @@ msgInput.addEventListener('input', () => {
 attachBtn.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', () => {
   const file = fileInput.files[0];
-  if (!file || !conn || !conn.open) return;
+  if (!file) return;
+  if (!conn || !conn.open) {
+    addSystemMessage('not connected — file not sent');
+    fileInput.value = '';
+    return;
+  }
 
   // Bumped to 10MB limit to accommodate small videos/audio
   if (file.size > 10 * 1024 * 1024) {
@@ -670,13 +785,22 @@ fileInput.addEventListener('change', () => {
 
   const reader = new FileReader();
   reader.onload = (e) => {
+    if (!conn || !conn.open) {
+      addSystemMessage('not connected — file not sent');
+      return;
+    }
     const payload = {
       type: 'file',
       name: file.name,
       category: category,
       data: e.target.result // Base64 Data URL
     };
-    conn.send(payload);
+    try {
+      conn.send(payload);
+    } catch (err) {
+      addSystemMessage('failed to send file — connection dropped');
+      return;
+    }
     addMessage(payload, 'me');
   };
   reader.readAsDataURL(file);
